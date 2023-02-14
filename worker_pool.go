@@ -42,6 +42,8 @@ type WorkerPool struct {
 	periodicEnqueuer *periodicEnqueuer
 }
 
+var _ Worker = (*WorkerPool)(nil)
+
 type jobType struct {
 	Name string
 	JobOptions
@@ -129,7 +131,7 @@ func NewWorkerPoolWithOptions(ctx interface{}, concurrency uint, namespace strin
 // Middleware appends the specified function to the middleware chain. The fn can take one of these forms:
 // (*ContextType).func(*Job, NextMiddlewareFunc) error, (ContextType matches the type of ctx specified when creating a pool)
 // func(*Job, NextMiddlewareFunc) error, for the generic middleware format.
-func (wp *WorkerPool) Middleware(fn interface{}) *WorkerPool {
+func (wp *WorkerPool) Middleware(fn interface{}) Worker {
 	vfn := reflect.ValueOf(fn)
 	validateMiddlewareType(wp.contextType, vfn)
 
@@ -155,13 +157,13 @@ func (wp *WorkerPool) Middleware(fn interface{}) *WorkerPool {
 // fn can take one of these forms:
 // (*ContextType).func(*Job) error, (ContextType matches the type of ctx specified when creating a pool)
 // func(*Job) error, for the generic handler format.
-func (wp *WorkerPool) Job(name string, fn interface{}) *WorkerPool {
+func (wp *WorkerPool) Job(name string, fn interface{}) Worker {
 	return wp.JobWithOptions(name, JobOptions{}, fn)
 }
 
 // JobWithOptions adds a handler for 'name' jobs as per the Job function, but permits you specify additional options
 // such as a job's priority, retry count, and whether to send dead jobs to the dead job queue or trash them.
-func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interface{}) *WorkerPool {
+func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interface{}) Worker {
 	jobOpts = applyDefaultsAndValidate(jobOpts)
 
 	vfn := reflect.ValueOf(fn)
@@ -189,7 +191,7 @@ func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interfa
 // The spec format is based on https://godoc.org/github.com/robfig/cron, which is a relatively standard cron format.
 // Note that the first value is the seconds!
 // If you have multiple worker pools on different machines, they'll all coordinate and only enqueue your job once.
-func (wp *WorkerPool) PeriodicallyEnqueue(spec string, jobName string) *WorkerPool {
+func (wp *WorkerPool) PeriodicallyEnqueue(spec string, jobName string) Worker {
 	schedule, err := cron.Parse(spec)
 	if err != nil {
 		panic(err)
