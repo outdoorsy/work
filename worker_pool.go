@@ -42,8 +42,6 @@ type WorkerPool struct {
 	periodicEnqueuer *periodicEnqueuer
 }
 
-var _ Worker = (*WorkerPool)(nil)
-
 type jobType struct {
 	Name string
 	JobOptions
@@ -97,13 +95,13 @@ type middlewareHandler struct {
 
 // NewWorkerPool creates a new worker pool. ctx should be a struct literal whose type will be used for middleware and handlers.
 // concurrency specifies how many workers to spin up - each worker can process jobs concurrently.
-func NewWorkerPool(ctx interface{}, concurrency uint, namespace string, pool *redis.Pool) Worker {
+func NewWorkerPool(ctx interface{}, concurrency uint, namespace string, pool *redis.Pool) *WorkerPool {
 	return NewWorkerPoolWithOptions(ctx, concurrency, namespace, pool, WorkerPoolOptions{})
 }
 
 // NewWorkerPoolWithOptions creates a new worker pool as per the NewWorkerPool function, but permits you to specify
 // additional options such as sleep backoffs.
-func NewWorkerPoolWithOptions(ctx interface{}, concurrency uint, namespace string, pool *redis.Pool, workerPoolOpts WorkerPoolOptions) Worker {
+func NewWorkerPoolWithOptions(ctx interface{}, concurrency uint, namespace string, pool *redis.Pool, workerPoolOpts WorkerPoolOptions) *WorkerPool {
 	if pool == nil {
 		panic("NewWorkerPool needs a non-nil *redis.Pool")
 	}
@@ -131,7 +129,7 @@ func NewWorkerPoolWithOptions(ctx interface{}, concurrency uint, namespace strin
 // Middleware appends the specified function to the middleware chain. The fn can take one of these forms:
 // (*ContextType).func(*Job, NextMiddlewareFunc) error, (ContextType matches the type of ctx specified when creating a pool)
 // func(*Job, NextMiddlewareFunc) error, for the generic middleware format.
-func (wp *WorkerPool) Middleware(fn interface{}) Worker {
+func (wp *WorkerPool) Middleware(fn interface{}) *WorkerPool {
 	vfn := reflect.ValueOf(fn)
 	validateMiddlewareType(wp.contextType, vfn)
 
@@ -157,13 +155,13 @@ func (wp *WorkerPool) Middleware(fn interface{}) Worker {
 // fn can take one of these forms:
 // (*ContextType).func(*Job) error, (ContextType matches the type of ctx specified when creating a pool)
 // func(*Job) error, for the generic handler format.
-func (wp *WorkerPool) Job(name string, fn interface{}) Worker {
+func (wp *WorkerPool) Job(name string, fn interface{}) *WorkerPool {
 	return wp.JobWithOptions(name, JobOptions{}, fn)
 }
 
 // JobWithOptions adds a handler for 'name' jobs as per the Job function, but permits you specify additional options
 // such as a job's priority, retry count, and whether to send dead jobs to the dead job queue or trash them.
-func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interface{}) Worker {
+func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interface{}) *WorkerPool {
 	jobOpts = applyDefaultsAndValidate(jobOpts)
 
 	vfn := reflect.ValueOf(fn)
@@ -191,7 +189,7 @@ func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interfa
 // The spec format is based on https://godoc.org/github.com/robfig/cron, which is a relatively standard cron format.
 // Note that the first value is the seconds!
 // If you have multiple worker pools on different machines, they'll all coordinate and only enqueue your job once.
-func (wp *WorkerPool) PeriodicallyEnqueue(spec string, jobName string) Worker {
+func (wp *WorkerPool) PeriodicallyEnqueue(spec string, jobName string) *WorkerPool {
 	schedule, err := cron.Parse(spec)
 	if err != nil {
 		panic(err)
@@ -337,11 +335,11 @@ func validateMiddlewareType(ctxType reflect.Type, vfn reflect.Value) {
 // Since it's easy to pass the wrong method as a middleware/handler, and since the user can't rely on static type checking since we use reflection,
 // lets be super helpful about what they did and what they need to do.
 // Arguments:
-//  - vfn is the failed method
-//  - addingType is for "You are adding {addingType} to a worker pool...". Eg, "middleware" or "a handler"
-//  - yourType is for "Your {yourType} function can have...". Eg, "middleware" or "handler" or "error handler"
-//  - args is like "rw web.ResponseWriter, req *web.Request, next web.NextMiddlewareFunc"
-//    - NOTE: args can be calculated if you pass in each type. BUT, it doesn't have example argument name, so it has less copy/paste value.
+//   - vfn is the failed method
+//   - addingType is for "You are adding {addingType} to a worker pool...". Eg, "middleware" or "a handler"
+//   - yourType is for "Your {yourType} function can have...". Eg, "middleware" or "handler" or "error handler"
+//   - args is like "rw web.ResponseWriter, req *web.Request, next web.NextMiddlewareFunc"
+//   - NOTE: args can be calculated if you pass in each type. BUT, it doesn't have example argument name, so it has less copy/paste value.
 func instructiveMessage(vfn reflect.Value, addingType string, yourType string, args string, ctxType reflect.Type) string {
 	// Get context type without package.
 	ctxString := ctxType.String()
