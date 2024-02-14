@@ -16,12 +16,12 @@ func TestClientWorkerPoolHeartbeats(t *testing.T) {
 	ns := "work"
 	cleanKeyspace(ns, pool)
 
-	wp := NewWorkerPool(TestContext{}, 10, ns, pool)
+	wp := NewWorkerPool(TestContext{}, 10, ns, pool).(*WorkerPool)
 	wp.Job("wat", func(job *Job) error { return nil })
 	wp.Job("bob", func(job *Job) error { return nil })
 	wp.Start()
 
-	wp2 := NewWorkerPool(TestContext{}, 11, ns, pool)
+	wp2 := NewWorkerPool(TestContext{}, 11, ns, pool).(*WorkerPool)
 	wp2.Job("foo", func(job *Job) error { return nil })
 	wp2.Job("bar", func(job *Job) error { return nil })
 	wp2.Start()
