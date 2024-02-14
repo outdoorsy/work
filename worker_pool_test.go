@@ -222,5 +222,5 @@ func setupTestWorkerPool(pool *redis.Pool, namespace, jobName string, concurrenc
 	wp.JobWithOptions(jobName, jobOpts, (*TestContext).SleepyJob)
 	// reset the backoff times to help with testing
 	sleepBackoffsInMilliseconds = []int64{10, 10, 10, 10, 10}
-	return wp
+	return wp.(*WorkerPool)
 }
