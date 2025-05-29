@@ -5,6 +5,17 @@ import React from 'react';
 import { mount } from 'enzyme';
 
 describe('DeadJobs', () => {
+  let originalConfirm;
+
+  beforeEach(() => {
+    originalConfirm = window.confirm;
+    window.confirm = function() { return true; }; // Default to confirming actions
+  });
+
+  afterEach(() => {
+    window.confirm = originalConfirm;
+  });
+
   it('shows dead jobs', () => {
     let deadJobs = mount(<DeadJobs />);
 
@@ -63,6 +74,38 @@ describe('DeadJobs', () => {
     expect(checkbox.at(0).props().checked).toEqual(false);
     expect(checkbox.at(1).props().checked).toEqual(false);
     expect(checkbox.at(2).props().checked).toEqual(false);
+  });
+
+  it('handles confirmation dialogs', () => {
+    let deadJobs = mount(<DeadJobs />);
+    let confirmCalls = [];
+
+    // Override window.confirm to track calls
+    window.confirm = function(message) {
+      confirmCalls.push(message);
+      return true;
+    };
+
+    // Test delete selected with confirmation
+    deadJobs.find('button').at(0).simulate('click');
+    expect(confirmCalls[0]).toBe('Are you sure you want to delete the selected jobs?');
+
+    // Test retry selected with confirmation
+    deadJobs.find('button').at(1).simulate('click');
+    expect(confirmCalls[1]).toBe('Are you sure you want to retry the selected jobs?');
+
+    // Test delete all with confirmation
+    deadJobs.find('button').at(2).simulate('click');
+    expect(confirmCalls[2]).toBe('Are you sure you want to delete all jobs?');
+
+    // Test retry all with confirmation
+    deadJobs.find('button').at(3).simulate('click');
+    expect(confirmCalls[3]).toBe('Are you sure you want to retry all jobs?');
+
+    // Test cancellation
+    window.confirm = function() { return false; };
+    deadJobs.find('button').at(0).simulate('click');
+    // The action should not be performed when cancelled
   });
 
   it('has pages', () => {
