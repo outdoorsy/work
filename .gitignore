@@ -1,0 +1,23 @@
+# Go specific
+/vendor/
+/bin/
+/dist/
+
+# Go workspace specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node.js specific
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env
+.env.local
+.env.*.local
+
+# IDE specific
+.idea/
+.vscode/

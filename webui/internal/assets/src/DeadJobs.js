@@ -119,6 +119,13 @@ export default class DeadJobs extends React.Component {
     });
   }
 
+  confirmAndRun(message, action) {
+    const confirmed = window.confirm(message);
+    if (confirmed) {
+      action();
+    }
+  }
+
   render() {
     return (
       <div>
@@ -156,10 +163,10 @@ export default class DeadJobs extends React.Component {
           </div>
         </div>
         <div className={styles.btnGroup} role="group">
-          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.deleteSelected()}>Delete Selected Jobs</button>
-          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.retrySelected()}>Retry Selected Jobs</button>
-          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.deleteAll()}>Delete All Jobs</button>
-          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.retryAll()}>Retry All Jobs</button>
+          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.confirmAndRun('Are you sure you want to delete the selected jobs?', () => this.deleteSelected())}>Delete Selected Jobs</button>
+          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.confirmAndRun('Are you sure you want to retry the selected jobs?', () => this.retrySelected())}>Retry Selected Jobs</button>
+          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.confirmAndRun('Are you sure you want to delete all jobs?', () => this.deleteAll())}>Delete All Jobs</button>
+          <button type="button" className={cx(styles.btn, styles.btnDefault)} onClick={() => this.confirmAndRun('Are you sure you want to retry all jobs?', () => this.retryAll())}>Retry All Jobs</button>
         </div>
       </div>
     );
