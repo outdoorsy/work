@@ -169,6 +169,43 @@ func TestPeriodicEnqueuerTryEnqueueReleasesClaimOnFailure(t *testing.T) {
 	assert.True(t, pe.shouldEnqueue())
 }
 
+// TestPeriodicEnqueuerReleaseClaimDoesNotStealANewerClaim guards against a
+// narrower edge case than the one above: if this process's own claim has
+// already expired and a *different* process has since claimed the window,
+// this process calling releaseClaim() (e.g. because its own long-delayed
+// enqueue() attempt finally errors out) must not delete that other,
+// currently-valid claim out from under it. releaseClaim() must only ever
+// release the exact claim this process itself made.
+func TestPeriodicEnqueuerReleaseClaimDoesNotStealANewerClaim(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	cleanKeyspace(ns, pool)
+
+	setNowEpochSecondsMock(1468359453)
+	defer resetNowEpochSecondsMock()
+
+	pe := newPeriodicEnqueuer(ns, pool, nil)
+	assert.True(t, pe.shouldEnqueue()) // pe claims at 1468359453
+
+	// Simulate another process's claim expiring and being re-claimed later,
+	// long after pe's own (now-stale) claim.
+	conn := pool.Get()
+	newerClaim := int64(1468359453 + 500)
+	_, err := conn.Do("SET", redisKeyLastPeriodicEnqueue(ns), newerClaim)
+	assert.NoError(t, err)
+	conn.Close()
+
+	// pe's enqueue() finally fails and it tries to release its own
+	// (long-expired) claim -- this must not touch the newer one.
+	pe.releaseClaim()
+
+	conn = pool.Get()
+	defer conn.Close()
+	current, err := redis.Int64(conn.Do("GET", redisKeyLastPeriodicEnqueue(ns)))
+	assert.NoError(t, err)
+	assert.EqualValues(t, newerClaim, current)
+}
+
 // TestPeriodicEnqueuerShouldEnqueueRace guards against the check-then-act
 // race the old GET-then-SET implementation had: many periodicEnqueuer
 // instances (standing in for many worker pool processes sharing one Redis

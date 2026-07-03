@@ -20,8 +20,16 @@ type periodicEnqueuer struct {
 	periodicJobs          []*periodicJob
 	scheduledPeriodicJobs []*scheduledPeriodicJob
 	shouldEnqueueScript   *redis.Script
-	stopChan              chan struct{}
-	doneStoppingChan      chan struct{}
+	releaseClaimScript    *redis.Script
+	// claimedAt is the timestamp this process last successfully claimed the
+	// periodic-enqueue window with (set by shouldEnqueue). releaseClaim uses
+	// it to release only that exact claim, never a later one made by
+	// another process. Safe as unsynchronized state because a single
+	// periodicEnqueuer's loop() goroutine calls shouldEnqueue and
+	// releaseClaim sequentially, never concurrently with itself.
+	claimedAt        int64
+	stopChan         chan struct{}
+	doneStoppingChan chan struct{}
 }
 
 // redisLuaShouldEnqueue atomically checks whether the last periodic enqueue
@@ -35,6 +43,18 @@ local last = redis.call('get', KEYS[1])
 if (last == false) or (tonumber(last) < (tonumber(ARGV[1]) - tonumber(ARGV[2]))) then
 	redis.call('set', KEYS[1], ARGV[1])
 	return 1
+end
+return 0
+`
+
+// redisLuaReleaseClaim deletes KEYS[1] only if it still holds the exact
+// value (ARGV[1]) this process claimed it with -- a compare-and-delete so a
+// process can never release a later claim made by someone else (e.g. if
+// this process's own claim already expired and another process re-claimed
+// the window before this one got around to releasing).
+var redisLuaReleaseClaim = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+	return redis.call('del', KEYS[1])
 end
 return 0
 `
@@ -57,6 +77,7 @@ func newPeriodicEnqueuer(namespace string, pool *redis.Pool, periodicJobs []*per
 		pool:                pool,
 		periodicJobs:        periodicJobs,
 		shouldEnqueueScript: redis.NewScript(1, redisLuaShouldEnqueue),
+		releaseClaimScript:  redis.NewScript(1, redisLuaReleaseClaim),
 		stopChan:            make(chan struct{}),
 		doneStoppingChan:    make(chan struct{}),
 	}
@@ -162,11 +183,16 @@ func (pe *periodicEnqueuer) shouldEnqueue() bool {
 	conn := pe.pool.Get()
 	defer conn.Close()
 
+	now := nowEpochSeconds()
 	thresholdSeconds := int64(periodicEnqueuerSleep / time.Second)
-	claimed, err := redis.Int(pe.shouldEnqueueScript.Do(conn, redisKeyLastPeriodicEnqueue(pe.namespace), nowEpochSeconds(), thresholdSeconds))
+	claimed, err := redis.Int(pe.shouldEnqueueScript.Do(conn, redisKeyLastPeriodicEnqueue(pe.namespace), now, thresholdSeconds))
 	if err != nil {
 		logError("periodic_enqueuer.should_enqueue", err)
 		return true
+	}
+
+	if claimed == 1 {
+		pe.claimedAt = now
 	}
 
 	return claimed == 1
@@ -174,12 +200,16 @@ func (pe *periodicEnqueuer) shouldEnqueue() bool {
 
 // releaseClaim clears the periodic-enqueue claim after a failed enqueue()
 // so the next tick -- possibly on a different process -- can retry right
-// away instead of waiting out the rest of the window.
+// away instead of waiting out the rest of the window. It only deletes the
+// claim if it still matches what this process set in shouldEnqueue(): if
+// this process's own claim already expired and another process claimed the
+// window in the meantime, releasing unconditionally would delete that
+// newer, valid claim and momentarily reopen the race.
 func (pe *periodicEnqueuer) releaseClaim() {
 	conn := pe.pool.Get()
 	defer conn.Close()
 
-	if _, err := conn.Do("DEL", redisKeyLastPeriodicEnqueue(pe.namespace)); err != nil {
+	if _, err := pe.releaseClaimScript.Do(conn, redisKeyLastPeriodicEnqueue(pe.namespace), pe.claimedAt); err != nil {
 		logError("periodic_enqueuer.release_claim", err)
 	}
 }
