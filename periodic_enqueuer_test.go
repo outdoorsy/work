@@ -118,6 +118,20 @@ func TestPeriodicEnqueuerSpawn(t *testing.T) {
 	pe.stop()
 }
 
+// TestPeriodicEnqueuerShouldEnqueueFailsOpen asserts that when Redis is
+// unreachable, shouldEnqueue() fails open (returns true) rather than
+// silently skipping periodic jobs forever. This is the same fail-open
+// behavior the old GET-based implementation had; the switch to a Lua
+// script must not regress it.
+func TestPeriodicEnqueuerShouldEnqueueFailsOpen(t *testing.T) {
+	pool := newTestPool("notworking:6379")
+	ns := "work"
+
+	pe := newPeriodicEnqueuer(ns, pool, nil)
+
+	assert.True(t, pe.shouldEnqueue())
+}
+
 // TestPeriodicEnqueuerShouldEnqueueRace guards against the check-then-act
 // race the old GET-then-SET implementation had: many periodicEnqueuer
 // instances (standing in for many worker pool processes sharing one Redis
