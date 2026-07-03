@@ -76,12 +76,7 @@ func (pe *periodicEnqueuer) loop() {
 	timer := time.NewTimer(periodicEnqueuerSleep + time.Duration(rand.Intn(30))*time.Second)
 	defer timer.Stop()
 
-	if pe.shouldEnqueue() {
-		err := pe.enqueue()
-		if err != nil {
-			logError("periodic_enqueuer.loop.enqueue", err)
-		}
-	}
+	pe.tryEnqueue()
 
 	for {
 		select {
@@ -90,13 +85,26 @@ func (pe *periodicEnqueuer) loop() {
 			return
 		case <-timer.C:
 			timer.Reset(periodicEnqueuerSleep + time.Duration(rand.Intn(30))*time.Second)
-			if pe.shouldEnqueue() {
-				err := pe.enqueue()
-				if err != nil {
-					logError("periodic_enqueuer.loop.enqueue", err)
-				}
-			}
+			pe.tryEnqueue()
 		}
+	}
+}
+
+// tryEnqueue claims the periodic-enqueue window (if it's this process's
+// turn) and runs enqueue(). If enqueue() fails partway, it releases the
+// claim rather than leaving it held for the rest of the window: enqueue()'s
+// scheduling only ever looks forward from the current time, so any cron
+// occurrence that should have fired during a held-but-failed window would
+// otherwise be skipped permanently, not merely delayed, once the next
+// successful attempt starts looking forward from its own later "now".
+func (pe *periodicEnqueuer) tryEnqueue() {
+	if !pe.shouldEnqueue() {
+		return
+	}
+
+	if err := pe.enqueue(); err != nil {
+		logError("periodic_enqueuer.loop.enqueue", err)
+		pe.releaseClaim()
 	}
 }
 
@@ -162,6 +170,18 @@ func (pe *periodicEnqueuer) shouldEnqueue() bool {
 	}
 
 	return claimed == 1
+}
+
+// releaseClaim clears the periodic-enqueue claim after a failed enqueue()
+// so the next tick -- possibly on a different process -- can retry right
+// away instead of waiting out the rest of the window.
+func (pe *periodicEnqueuer) releaseClaim() {
+	conn := pe.pool.Get()
+	defer conn.Close()
+
+	if _, err := conn.Do("DEL", redisKeyLastPeriodicEnqueue(pe.namespace)); err != nil {
+		logError("periodic_enqueuer.release_claim", err)
+	}
 }
 
 func makeUniquePeriodicID(name, spec string, epoch int64) string {

@@ -132,6 +132,43 @@ func TestPeriodicEnqueuerShouldEnqueueFailsOpen(t *testing.T) {
 	assert.True(t, pe.shouldEnqueue())
 }
 
+// TestPeriodicEnqueuerTryEnqueueReleasesClaimOnFailure guards against a
+// regression where claiming the window before enqueue() runs could turn a
+// single transient enqueue() failure into a permanently skipped occurrence
+// for any job scheduled more often than the claim window: enqueue()'s
+// scheduling only looks forward from "now", so if the window stayed held
+// for its full duration after a failed attempt, the next successful
+// attempt's forward-looking scan would never go back and pick up whatever
+// should have fired in between.
+func TestPeriodicEnqueuerTryEnqueueReleasesClaimOnFailure(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	cleanKeyspace(ns, pool)
+
+	var pjs []*periodicJob
+	pjs = appendPeriodicJob(pjs, "0/29 * * * * *", "foo")
+
+	setNowEpochSecondsMock(1468359453)
+	defer resetNowEpochSecondsMock()
+
+	conn := pool.Get()
+	// Force enqueue()'s ZADD to fail with a real Redis error by making the
+	// scheduled-jobs key the wrong type -- this exercises the actual
+	// failure path through a live connection, not a broken pool (which
+	// would make shouldEnqueue() fail open before ever claiming anything).
+	_, err := conn.Do("SET", redisKeyScheduled(ns), "not-a-sorted-set")
+	assert.NoError(t, err)
+	conn.Close()
+
+	pe := newPeriodicEnqueuer(ns, pool, pjs)
+
+	pe.tryEnqueue()
+
+	// The claim must have been released on failure, not held for the rest
+	// of the window, so the very next attempt can retry immediately.
+	assert.True(t, pe.shouldEnqueue())
+}
+
 // TestPeriodicEnqueuerShouldEnqueueRace guards against the check-then-act
 // race the old GET-then-SET implementation had: many periodicEnqueuer
 // instances (standing in for many worker pool processes sharing one Redis
