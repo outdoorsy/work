@@ -105,6 +105,39 @@ func TestObserverCheckinFromJob(t *testing.T) {
 	assert.Equal(t, fmt.Sprint(tMockCheckin), h["checkin_at"])
 }
 
+// TestObserverDoesNotShareArgumentsMapWithCaller guards against the
+// production crash this fix addresses: "fatal error: concurrent map
+// iteration and map write" in writeStatus's json.Marshal, caused by the
+// observer aliasing the caller's arguments map instead of copying it. Run
+// with -race: without the fix, mutating the original map concurrently with
+// draining (which marshals the stored observation) is flagged as a data
+// race; with the fix, the observer only ever touches its own copy.
+func TestObserverDoesNotShareArgumentsMapWithCaller(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+
+	observer := newObserver(ns, pool, "race-test")
+	observer.start()
+	defer observer.stop()
+
+	args := map[string]interface{}{"a": 1}
+	observer.observeStarted("foo", "bar", args)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 10000 {
+			args[fmt.Sprintf("k%d", i%50)] = i
+		}
+	}()
+
+	for range 200 {
+		observer.drain()
+	}
+
+	<-done
+}
+
 func readHash(pool *redis.Pool, key string) map[string]string {
 	m := make(map[string]string)
 

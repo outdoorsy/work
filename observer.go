@@ -97,8 +97,36 @@ func (o *observer) observeStarted(jobName, jobID string, arguments map[string]in
 		jobName:   jobName,
 		jobID:     jobID,
 		startedAt: nowEpochSeconds(),
-		arguments: arguments,
+		// Copy rather than alias the caller's map. The observer's own
+		// goroutine reads this later (writeStatus marshals it to JSON,
+		// possibly seconds after the job started), concurrently with
+		// whatever the caller does with its own copy of the same map --
+		// e.g. a job's Args populated from a shared/reused map at the
+		// call site. Go maps aren't safe for concurrent iterate + write,
+		// and that exact pattern has caused "fatal error: concurrent map
+		// iteration and map write" crashes in production.
+		arguments: copyArgs(arguments),
 	}
+}
+
+// copyArgs returns a shallow copy of args, or nil if args is nil.
+//
+// Shallow by design: this severs top-level aliasing of the caller's map,
+// which is the pattern that caused the production crash (see observeStarted).
+// Nested reference values (a map or slice stored as one of the values) are
+// still shared with whatever the caller does with them -- acceptable here
+// because Args is a debug-only payload (job.Args, populated by unmarshaling
+// plain JSON scalars/containers), not a value anything else holds a live,
+// concurrently-mutated reference into.
+func copyArgs(args map[string]interface{}) map[string]interface{} {
+	if args == nil {
+		return nil
+	}
+	cp := make(map[string]interface{}, len(args))
+	for k, v := range args {
+		cp[k] = v
+	}
+	return cp
 }
 
 func (o *observer) observeDone(jobName, jobID string, err error) {
