@@ -3,6 +3,7 @@ package work
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
@@ -109,7 +110,9 @@ func (o *observer) observeStarted(jobName, jobID string, arguments map[string]in
 	}
 }
 
-// copyArgs returns a shallow copy of args, or nil if args is nil.
+// copyArgs returns a shallow copy of args, or nil if args is nil. Backed by
+// the standard library's maps.Clone, which has the same nil-in/nil-out and
+// shallow semantics this needs -- no reason to hand-roll the loop.
 //
 // Shallow by design: this severs top-level aliasing of the caller's map,
 // which is the pattern that caused the production crash (see observeStarted).
@@ -119,14 +122,7 @@ func (o *observer) observeStarted(jobName, jobID string, arguments map[string]in
 // plain JSON scalars/containers), not a value anything else holds a live,
 // concurrently-mutated reference into.
 func copyArgs(args map[string]interface{}) map[string]interface{} {
-	if args == nil {
-		return nil
-	}
-	cp := make(map[string]interface{}, len(args))
-	for k, v := range args {
-		cp[k] = v
-	}
-	return cp
+	return maps.Clone(args)
 }
 
 func (o *observer) observeDone(jobName, jobID string, err error) {
