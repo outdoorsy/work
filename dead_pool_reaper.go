@@ -151,7 +151,7 @@ func (r *deadPoolReaper) reapOrphanedLocks() {
 	for _, jobType := range r.curJobTypes {
 		poolIDs, err := redis.Strings(conn.Receive())
 		if err != nil {
-			logError("dead_pool_reaper.orphan.lock_info", err)
+			logError("dead_pool_reaper.orphan.lock_info", fmt.Errorf("job %s: %w", jobType, err))
 			continue
 		}
 		for _, poolID := range poolIDs {
@@ -181,7 +181,7 @@ func (r *deadPoolReaper) reapOrphanedLocks() {
 		if err == redis.ErrNil || (err == nil && !time.Unix(heartbeatAt, 0).After(cutoff)) {
 			orphans[poolID] = struct{}{}
 		} else if err != nil {
-			logError("dead_pool_reaper.orphan.heartbeat", err)
+			logError("dead_pool_reaper.orphan.heartbeat", fmt.Errorf("pool %s: %w", poolID, err))
 		}
 	}
 

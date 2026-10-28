@@ -450,6 +450,13 @@ func TestDeadPoolReaperOrphanedLockCounts(t *testing.T) {
 			assert.NoError(t, reaper.reap())
 			assert.EqualValues(t, tc.wantLock, lockCount(pool, lockKey))
 			assertNoLockInfo(t, pool, lockInfoKey, "gone")
+			if tc.lock == nil {
+				conn := pool.Get()
+				exists, err := redis.Bool(conn.Do("EXISTS", lockKey))
+				conn.Close()
+				assert.NoError(t, err)
+				assert.False(t, exists)
+			}
 		})
 	}
 }
@@ -480,6 +487,53 @@ func TestDeadPoolReaperOrphanedLockPassesReplaced(t *testing.T) {
 	assert.EqualValues(t, 0, lockCount(pool, lockKey))
 }
 
+func TestDeadPoolReaperOrphanedLockRegisteredPoolNotCounted(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	lockInfoKey := redisKeyJobsLockInfo(ns, job1)
+	cleanKeyspace(ns, pool)
+
+	// stale heartbeat without job_names: findDeadPools leaves it in worker_pools
+	seedRedis(t, pool,
+		cmd("SADD", redisKeyWorkerPools(ns), "p"),
+		cmd("HSET", redisKeyHeartbeat(ns, "p"), "heartbeat_at", time.Now().Add(-time.Hour).Unix()),
+		cmd("SET", redisKeyJobsLock(ns, job1), 1),
+		cmd("HSET", lockInfoKey, "p", 1),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	assert.NoError(t, reaper.reap())
+	seedRedis(t, pool, cmd("SREM", redisKeyWorkerPools(ns), "p"))
+	assert.NoError(t, reaper.reap())
+	assertLockInfo(t, pool, lockInfoKey, "p", 1)
+
+	assert.NoError(t, reaper.reap())
+	assertNoLockInfo(t, pool, lockInfoKey, "p")
+	assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job1)))
+}
+
+func TestDeadPoolReaperOrphanedLockUsesReaperDeadTime(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	lockInfoKey := redisKeyJobsLockInfo(ns, job1)
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool,
+		cmd("HSET", redisKeyHeartbeat(ns, "p"), "heartbeat_at", time.Now().Add(-5*time.Second).Unix()),
+		cmd("SET", redisKeyJobsLock(ns, job1), 1),
+		cmd("HSET", lockInfoKey, "p", 1),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	reaper.deadTime = time.Second
+	assert.NoError(t, reaper.reap())
+	assert.NoError(t, reaper.reap())
+	assertNoLockInfo(t, pool, lockInfoKey, "p")
+	assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job1)))
+}
+
 func TestDeadPoolReaperOrphanedLockTwoReapers(t *testing.T) {
 	pool := newTestPool(":6379")
 	ns := "work"
@@ -496,6 +550,13 @@ func TestDeadPoolReaperOrphanedLockTwoReapers(t *testing.T) {
 	}
 	assert.EqualValues(t, 1, lockCount(pool, lockKey))
 	assertNoLockInfo(t, pool, lockInfoKey, "gone")
+
+	conn := pool.Get()
+	defer conn.Close()
+	removed, err := redis.Int(r1.orphanedLockScript.Do(conn, lockKey, lockInfoKey,
+		redisKeyWorkerPools(ns), redisKeyHeartbeat(ns, "gone"), "gone", time.Now().Unix()))
+	assert.NoError(t, err)
+	assert.Equal(t, 0, removed)
 }
 
 func TestDeadPoolReaperOrphanedLockScriptErrorContinues(t *testing.T) {
@@ -677,6 +738,11 @@ func TestReapOrphanedLockScript(t *testing.T) {
 			cmd("SADD", redisKeyWorkerPools(ns), "live"),
 			cmd("HSET", lockInfoKey, "live", "abc"),
 		}, true, 0, "1"},
+		{"zero count does not read other counts", [][]interface{}{
+			cmd("HSET", lockInfoKey, "p", 0),
+			cmd("SADD", redisKeyWorkerPools(ns), "live"),
+			cmd("HSET", lockInfoKey, "live", "abc"),
+		}, false, 1, "1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
