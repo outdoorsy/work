@@ -640,6 +640,7 @@ func TestReapOrphanedLockScript(t *testing.T) {
 	ns := "work"
 	job1 := "job1"
 	lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+	cutoff := time.Now().Add(-deadTime).Unix()
 	cases := []struct {
 		name        string
 		seed        [][]interface{}
@@ -656,6 +657,19 @@ func TestReapOrphanedLockScript(t *testing.T) {
 		{"heartbeat without heartbeat_at", [][]interface{}{
 			cmd("HSET", redisKeyHeartbeat(ns, "p"), "job_names", job1),
 		}, false, 1, "0"},
+		{"heartbeat at the cutoff is stale", [][]interface{}{
+			cmd("HSET", redisKeyHeartbeat(ns, "p"), "heartbeat_at", cutoff),
+		}, false, 1, "0"},
+		{"live counts are summed", [][]interface{}{
+			cmd("SET", lockKey, 2),
+			cmd("SADD", redisKeyWorkerPools(ns), "a", "b"),
+			cmd("HSET", lockInfoKey, "a", 1, "b", 1),
+		}, false, 1, "2"},
+		// e.g. a live pool the old reaper wrongly reaped, whose running job then released its lock
+		{"negative live count does not lower the floor", [][]interface{}{
+			cmd("SADD", redisKeyWorkerPools(ns), "a", "b"),
+			cmd("HSET", lockInfoKey, "a", 1, "b", -1),
+		}, false, 1, "1"},
 		{"non-numeric lock", [][]interface{}{
 			cmd("SET", lockKey, "abc"),
 		}, true, 0, "abc"},
@@ -675,7 +689,7 @@ func TestReapOrphanedLockScript(t *testing.T) {
 			conn := pool.Get()
 			defer conn.Close()
 			removed, err := redis.Int64(reaper.orphanedLockScript.Do(conn, lockKey, lockInfoKey,
-				redisKeyWorkerPools(ns), redisKeyHeartbeat(ns, "p"), "p", time.Now().Add(-reaper.deadTime).Unix()))
+				redisKeyWorkerPools(ns), redisKeyHeartbeat(ns, "p"), "p", cutoff))
 			if tc.wantErr {
 				assert.Error(t, err)
 			} else {

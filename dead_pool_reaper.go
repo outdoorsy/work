@@ -196,7 +196,7 @@ func (r *deadPoolReaper) reapOrphanedLocks() {
 	for _, jobType := range r.curJobTypes {
 		lockKey := redisKeyJobsLock(r.namespace, jobType)
 		lockInfoKey := redisKeyJobsLockInfo(r.namespace, jobType)
-		sent := 0
+		var sent []string
 		for _, poolID := range candidatesByJob[jobType] {
 			_, orphan := orphans[poolID]
 			_, wasOrphan := confirmed[poolID]
@@ -204,26 +204,26 @@ func (r *deadPoolReaper) reapOrphanedLocks() {
 				continue
 			}
 			r.orphanedLockScript.SendHash(conn, lockKey, lockInfoKey, workerPoolsKey, redisKeyHeartbeat(r.namespace, poolID), poolID, cutoff.Unix())
-			sent++
+			sent = append(sent, poolID)
 		}
-		if sent == 0 {
+		if len(sent) == 0 {
 			continue
 		}
 		if err := conn.Flush(); err != nil {
-			logError("dead_pool_reaper.orphan", err)
+			logError("dead_pool_reaper.orphan", fmt.Errorf("job %s pools %v: %w", jobType, sent, err))
 			continue
 		}
-		for i := 0; i < sent; i++ {
+		for _, poolID := range sent {
 			removed, err := redis.Int(conn.Receive())
 			if err != nil {
-				logError("dead_pool_reaper.orphan", err)
+				logError("dead_pool_reaper.orphan", fmt.Errorf("job %s pool %s: %w", jobType, poolID, err))
 				continue
 			}
 			reaped += removed
 		}
 	}
 	if reaped > 0 {
-		fmt.Printf("INFO: dead_pool_reaper.orphan - reaped %d lock info entries of pools gone from worker_pools\n", reaped)
+		logInfo("dead_pool_reaper.orphan", fmt.Sprintf("reaped %d lock info entries of pools gone from worker_pools", reaped))
 	}
 }
 
