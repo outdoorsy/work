@@ -345,3 +345,414 @@ func TestDeadPoolReaperCleanStaleLocks(t *testing.T) {
 	v, err = conn.Do("HGET", lockInfo2, workerPoolID2)
 	assert.Nil(t, v)
 }
+
+func TestDeadPoolReaperOrphanedLock(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool,
+		cmd("SET", redisKeyJobsLock(ns, job1), 1),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job1), "gone", 1),
+		cmd("LPUSH", redisKeyJobsInProgress(ns, "gone", job1), `{"name":"job1"}`),
+		cmd("LPUSH", redisKeyJobs(ns, job1), `{"name":"job1"}`, `{"name":"job1"}`),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assertLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone", 1)
+
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone")
+	// lists are left as they are
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobsInProgress(ns, "gone", job1)))
+	assert.EqualValues(t, 2, listSize(pool, redisKeyJobs(ns, job1)))
+}
+
+func TestDeadPoolReaperOrphanedLockHeartbeat(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool,
+		cmd("SET", lockKey, 4),
+		// live: in worker_pools with a fresh heartbeat
+		cmd("SADD", redisKeyWorkerPools(ns), "live"),
+		cmd("HSET", redisKeyHeartbeat(ns, "live"), "heartbeat_at", time.Now().Unix()),
+		cmd("HSET", lockInfoKey, "live", 1),
+		// starting: not in worker_pools yet, fresh heartbeat
+		cmd("HSET", redisKeyHeartbeat(ns, "starting"), "heartbeat_at", time.Now().Unix()),
+		cmd("HSET", lockInfoKey, "starting", 1),
+		// stale: not in worker_pools, heartbeat key left behind
+		cmd("HSET", redisKeyHeartbeat(ns, "stale"), "heartbeat_at", time.Now().Add(-time.Hour).Unix()),
+		cmd("HSET", lockInfoKey, "stale", 1),
+		// noat: not in worker_pools, heartbeat key without heartbeat_at
+		cmd("HSET", redisKeyHeartbeat(ns, "noat"), "job_names", job1),
+		cmd("HSET", lockInfoKey, "noat", 1),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	for i := 0; i < 3; i++ {
+		assert.NoError(t, reaper.reap())
+	}
+	assert.EqualValues(t, 2, lockCount(pool, lockKey))
+	assertLockInfo(t, pool, lockInfoKey, "live", 1)
+	assertLockInfo(t, pool, lockInfoKey, "starting", 1)
+	assertNoLockInfo(t, pool, lockInfoKey, "stale")
+	assertNoLockInfo(t, pool, lockInfoKey, "noat")
+}
+
+func TestDeadPoolReaperOrphanedLockCounts(t *testing.T) {
+	ns := "work"
+	cases := []struct {
+		name     string
+		lock     interface{} // nil: no lock key
+		orphan   int64
+		live     int64 // count of a live pool, 0: none
+		wantLock int64
+	}{
+		{"zero count", 3, 0, 0, 3},
+		{"floor holds live locks", 1, 1, 1, 1},
+		{"never raises", 0, 1, 1, 0},
+		{"negative pays back up to the floor", 0, -1, 1, 1},
+		{"negative with no live pool", 0, -1, 0, 0},
+		{"negative never lowers", 2, -1, 1, 2},
+		{"clamps a negative lock", -1, 1, 0, 0},
+		{"clamps a negative lock on zero count", -1, 0, 0, 0},
+		{"missing lock key", nil, 1, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(":6379")
+			job1 := "job1"
+			lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+			cleanKeyspace(ns, pool)
+
+			seedRedis(t, pool, cmd("HSET", lockInfoKey, "gone", tc.orphan))
+			if tc.lock != nil {
+				seedRedis(t, pool, cmd("SET", lockKey, tc.lock))
+			}
+			if tc.live != 0 {
+				seedRedis(t, pool,
+					cmd("SADD", redisKeyWorkerPools(ns), "live"),
+					cmd("HSET", redisKeyHeartbeat(ns, "live"), "heartbeat_at", time.Now().Unix()),
+					cmd("HSET", lockInfoKey, "live", tc.live),
+				)
+			}
+
+			reaper := newDeadPoolReaper(ns, pool, []string{job1})
+			assert.NoError(t, reaper.reap())
+			assert.NoError(t, reaper.reap())
+			assert.EqualValues(t, tc.wantLock, lockCount(pool, lockKey))
+			assertNoLockInfo(t, pool, lockInfoKey, "gone")
+		})
+	}
+}
+
+func TestDeadPoolReaperOrphanedLockPassesReplaced(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool, cmd("SET", lockKey, 1), cmd("HSET", lockInfoKey, "p", 1))
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	assert.NoError(t, reaper.reap()) // orphan
+
+	seedRedis(t, pool,
+		cmd("SADD", redisKeyWorkerPools(ns), "p"),
+		cmd("HSET", redisKeyHeartbeat(ns, "p"), "heartbeat_at", time.Now().Unix()),
+	)
+	assert.NoError(t, reaper.reap()) // live
+
+	seedRedis(t, pool, cmd("SREM", redisKeyWorkerPools(ns), "p"), cmd("DEL", redisKeyHeartbeat(ns, "p")))
+	assert.NoError(t, reaper.reap()) // orphan again, first pass
+	assertLockInfo(t, pool, lockInfoKey, "p", 1)
+
+	assert.NoError(t, reaper.reap())
+	assertNoLockInfo(t, pool, lockInfoKey, "p")
+	assert.EqualValues(t, 0, lockCount(pool, lockKey))
+}
+
+func TestDeadPoolReaperOrphanedLockTwoReapers(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool, cmd("SET", lockKey, 2), cmd("HSET", lockInfoKey, "gone", 1))
+	r1 := newDeadPoolReaper(ns, pool, []string{job1})
+	r2 := newDeadPoolReaper(ns, pool, []string{job1})
+	for i := 0; i < 2; i++ {
+		assert.NoError(t, r1.reap())
+		assert.NoError(t, r2.reap())
+	}
+	assert.EqualValues(t, 1, lockCount(pool, lockKey))
+	assertNoLockInfo(t, pool, lockInfoKey, "gone")
+}
+
+func TestDeadPoolReaperOrphanedLockScriptErrorContinues(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1, job2 := "job1", "job2"
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool,
+		cmd("SADD", redisKeyWorkerPools(ns), "live"),
+		cmd("HSET", redisKeyHeartbeat(ns, "live"), "heartbeat_at", time.Now().Unix()),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job1), "live", "abc"),
+		cmd("SET", redisKeyJobsLock(ns, job1), 1),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job1), "gone", 1),
+		cmd("SET", redisKeyJobsLock(ns, job2), 1),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job2), "gone", 1),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1, job2})
+	assert.NoError(t, reaper.reap())
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assertLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone", 1)
+	assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job2)))
+	assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job2), "gone")
+}
+
+func TestDeadPoolReaperOrphanedLockAfterDeadPool(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1, job2 := "job1", "job2"
+	cleanKeyspace(ns, pool)
+
+	// a dead pool in worker_pools whose heartbeat names only job1
+	seedRedis(t, pool,
+		cmd("SADD", redisKeyWorkerPools(ns), "dead"),
+		cmd("HSET", redisKeyHeartbeat(ns, "dead"), "heartbeat_at", time.Now().Add(-time.Hour).Unix(), "job_names", job1),
+		cmd("SET", redisKeyJobsLock(ns, job1), 2),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job1), "dead", 1),
+		cmd("SET", redisKeyJobsLock(ns, job2), 1),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job2), "dead", 1),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1, job2})
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job2)))
+
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job2)))
+	assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job2), "dead")
+}
+
+func TestDeadPoolReaperOrphanedLockReadErrors(t *testing.T) {
+	ns := "work"
+	job1, job2 := "job1", "job2"
+
+	t.Run("heartbeat read error", func(t *testing.T) {
+		pool := newTestPool(":6379")
+		cleanKeyspace(ns, pool)
+		seedRedis(t, pool,
+			cmd("SET", redisKeyHeartbeat(ns, "p"), "not a hash"),
+			cmd("SET", redisKeyJobsLock(ns, job1), 1),
+			cmd("HSET", redisKeyJobsLockInfo(ns, job1), "p", 1),
+		)
+		reaper := newDeadPoolReaper(ns, pool, []string{job1})
+		assert.NoError(t, reaper.reap())
+		assert.NotContains(t, reaper.prevOrphans, "p")
+		assert.NoError(t, reaper.reap())
+		assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+		assertLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "p", 1)
+	})
+
+	t.Run("worker_pools read error", func(t *testing.T) {
+		pool := newTestPool(":6379")
+		cleanKeyspace(ns, pool)
+		seedRedis(t, pool,
+			cmd("SET", redisKeyWorkerPools(ns), "not a set"),
+			cmd("SET", redisKeyJobsLock(ns, job1), 1),
+			cmd("HSET", redisKeyJobsLockInfo(ns, job1), "gone", 1),
+		)
+		reaper := newDeadPoolReaper(ns, pool, []string{job1})
+		assert.Error(t, reaper.reap())
+		assert.Empty(t, reaper.prevOrphans)
+		assert.Error(t, reaper.reap())
+		assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+		assertLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone", 1)
+	})
+
+	t.Run("worker_pools read error keeps the previous pass", func(t *testing.T) {
+		pool := newTestPool(":6379")
+		cleanKeyspace(ns, pool)
+		seedRedis(t, pool,
+			cmd("SET", redisKeyJobsLock(ns, job1), 1),
+			cmd("HSET", redisKeyJobsLockInfo(ns, job1), "gone", 1),
+		)
+		reaper := newDeadPoolReaper(ns, pool, []string{job1})
+		assert.NoError(t, reaper.reap())
+		seedRedis(t, pool, cmd("SET", redisKeyWorkerPools(ns), "not a set"))
+		assert.Error(t, reaper.reap())
+		assertLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone", 1)
+		seedRedis(t, pool, cmd("DEL", redisKeyWorkerPools(ns)))
+		assert.NoError(t, reaper.reap())
+		assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job1)))
+		assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone")
+	})
+
+	t.Run("dead pool loop error", func(t *testing.T) {
+		pool := newTestPool(":6379")
+		cleanKeyspace(ns, pool)
+		seedRedis(t, pool,
+			cmd("SADD", redisKeyWorkerPools(ns), "broken"),
+			cmd("SET", redisKeyHeartbeat(ns, "broken"), "not a hash"),
+			cmd("SET", redisKeyJobsLock(ns, job1), 1),
+			cmd("HSET", redisKeyJobsLockInfo(ns, job1), "gone", 1),
+		)
+		reaper := newDeadPoolReaper(ns, pool, []string{job1})
+		assert.Error(t, reaper.reap())
+		assert.Error(t, reaper.reap())
+		assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job1)))
+		assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job1), "gone")
+	})
+
+	t.Run("lock info read error on one job type", func(t *testing.T) {
+		pool := newTestPool(":6379")
+		cleanKeyspace(ns, pool)
+		seedRedis(t, pool,
+			cmd("SET", redisKeyJobsLockInfo(ns, job1), "not a hash"),
+			cmd("SET", redisKeyJobsLock(ns, job2), 1),
+			cmd("HSET", redisKeyJobsLockInfo(ns, job2), "gone", 1),
+		)
+		reaper := newDeadPoolReaper(ns, pool, []string{job1, job2})
+		assert.NoError(t, reaper.reap())
+		assert.NoError(t, reaper.reap())
+		assert.EqualValues(t, 0, lockCount(pool, redisKeyJobsLock(ns, job2)))
+		assertNoLockInfo(t, pool, redisKeyJobsLockInfo(ns, job2), "gone")
+	})
+}
+
+func TestReapOrphanedLockScript(t *testing.T) {
+	ns := "work"
+	job1 := "job1"
+	lockKey, lockInfoKey := redisKeyJobsLock(ns, job1), redisKeyJobsLockInfo(ns, job1)
+	cases := []struct {
+		name        string
+		seed        [][]interface{}
+		wantErr     bool
+		wantRemoved int64
+		wantLock    string
+	}{
+		{"in worker_pools", [][]interface{}{
+			cmd("SADD", redisKeyWorkerPools(ns), "p"),
+		}, false, 0, "1"},
+		{"fresh heartbeat", [][]interface{}{
+			cmd("HSET", redisKeyHeartbeat(ns, "p"), "heartbeat_at", time.Now().Unix()),
+		}, false, 0, "1"},
+		{"heartbeat without heartbeat_at", [][]interface{}{
+			cmd("HSET", redisKeyHeartbeat(ns, "p"), "job_names", job1),
+		}, false, 1, "0"},
+		{"non-numeric lock", [][]interface{}{
+			cmd("SET", lockKey, "abc"),
+		}, true, 0, "abc"},
+		{"non-numeric lock info", [][]interface{}{
+			cmd("SADD", redisKeyWorkerPools(ns), "live"),
+			cmd("HSET", lockInfoKey, "live", "abc"),
+		}, true, 0, "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(":6379")
+			cleanKeyspace(ns, pool)
+			seedRedis(t, pool, cmd("SET", lockKey, 1), cmd("HSET", lockInfoKey, "p", 1))
+			seedRedis(t, pool, tc.seed...)
+
+			reaper := newDeadPoolReaper(ns, pool, []string{job1})
+			conn := pool.Get()
+			defer conn.Close()
+			removed, err := redis.Int64(reaper.orphanedLockScript.Do(conn, lockKey, lockInfoKey,
+				redisKeyWorkerPools(ns), redisKeyHeartbeat(ns, "p"), "p", time.Now().Add(-reaper.deadTime).Unix()))
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.wantRemoved, removed)
+			}
+
+			lock, err := redis.String(conn.Do("GET", lockKey))
+			assert.NoError(t, err)
+			assert.Equal(t, tc.wantLock, lock)
+			if tc.wantRemoved == 0 {
+				assertLockInfo(t, pool, lockInfoKey, "p", 1)
+			}
+		})
+	}
+}
+
+func TestDeadPoolReaperDeadPoolPayback(t *testing.T) {
+	pool := newTestPool(":6379")
+	ns := "work"
+	job1 := "job1"
+	cleanKeyspace(ns, pool)
+
+	seedRedis(t, pool,
+		cmd("SADD", redisKeyWorkerPools(ns), "live", "dead"),
+		cmd("HSET", redisKeyHeartbeat(ns, "live"), "heartbeat_at", time.Now().Unix()),
+		cmd("HSET", redisKeyHeartbeat(ns, "dead"), "heartbeat_at", time.Now().Add(-time.Hour).Unix(), "job_names", job1),
+		cmd("SET", redisKeyJobsLock(ns, job1), 2),
+		cmd("HSET", redisKeyJobsLockInfo(ns, job1), "live", 1, "dead", 1),
+		// leftover entries, e.g. from unique jobs, each requeued with its own decrement
+		cmd("LPUSH", redisKeyJobsInProgress(ns, "dead", job1), "a", "b", "c"),
+	)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, lockCount(pool, redisKeyJobsLock(ns, job1)))
+	assert.EqualValues(t, 3, listSize(pool, redisKeyJobs(ns, job1)))
+}
+
+func cmd(args ...interface{}) []interface{} {
+	return args
+}
+
+func seedRedis(t *testing.T, pool *redis.Pool, cmds ...[]interface{}) {
+	conn := pool.Get()
+	defer conn.Close()
+
+	for _, c := range cmds {
+		_, err := conn.Do(c[0].(string), c[1:]...)
+		assert.NoError(t, err)
+	}
+}
+
+// lockCount reads a lock that may not exist; getInt64 panics on a missing key
+func lockCount(pool *redis.Pool, key string) int64 {
+	conn := pool.Get()
+	defer conn.Close()
+
+	v, err := redis.Int64(conn.Do("GET", key))
+	if err == redis.ErrNil {
+		return 0
+	}
+	if err != nil {
+		panic("could not GET lock: " + err.Error())
+	}
+	return v
+}
+
+func assertLockInfo(t *testing.T, pool *redis.Pool, key, poolID string, want int64) {
+	assert.Equal(t, want, hgetInt64(pool, key, poolID))
+}
+
+func assertNoLockInfo(t *testing.T, pool *redis.Pool, key, poolID string) {
+	conn := pool.Get()
+	defer conn.Close()
+
+	exists, err := redis.Bool(conn.Do("HEXISTS", key, poolID))
+	assert.NoError(t, err)
+	assert.False(t, exists)
+}

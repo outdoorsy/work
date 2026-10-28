@@ -631,3 +631,69 @@ func TestWorkerPoolStop(t *testing.T) {
 		t.Errorf("Expected that jobs queue was not completely emptied.")
 	}
 }
+
+func TestWorkerUniqueByKeyReleasesInProgress(t *testing.T) {
+	ns := "work"
+	job1 := "job1"
+	cases := []struct {
+		name     string
+		enqueue  func(e *Enqueuer)
+		wantArgA float64
+	}{
+		{"scheduled", func(e *Enqueuer) {
+			// enqueued in the past, so the requeuer re-encodes it with a new enqueue time
+			setNowEpochSecondsMock(nowEpochSeconds() - 10)
+			defer resetNowEpochSecondsMock()
+			_, err := e.EnqueueUniqueInByKey(job1, 1, Q{"a": 1}, Q{"key": "k"})
+			assert.NoError(t, err)
+		}, 1},
+		{"duplicate with identical args", func(e *Enqueuer) {
+			_, err := e.EnqueueUniqueByKey(job1, Q{"a": 1}, Q{"key": "k"})
+			assert.NoError(t, err)
+			_, err = e.EnqueueUniqueByKey(job1, Q{"a": 1}, Q{"key": "k"})
+			assert.NoError(t, err)
+		}, 1},
+		{"duplicate with different args", func(e *Enqueuer) {
+			_, err := e.EnqueueUniqueByKey(job1, Q{"a": 1}, Q{"key": "k"})
+			assert.NoError(t, err)
+			_, err = e.EnqueueUniqueByKey(job1, Q{"a": 2}, Q{"key": "k"})
+			assert.NoError(t, err)
+		}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(":6379")
+			cleanKeyspace(ns, pool)
+
+			var runs int64
+			var argA float64
+			jobTypes := map[string]*jobType{job1: {
+				Name:       job1,
+				JobOptions: JobOptions{Priority: 1},
+				IsGeneric:  true,
+				GenericHandler: func(job *Job) error {
+					atomic.AddInt64(&runs, 1)
+					argA = job.Args["a"].(float64)
+					return nil
+				},
+			}}
+
+			tc.enqueue(NewEnqueuer(ns, pool))
+			re := newRequeuer(ns, pool, redisKeyScheduled(ns), []string{job1})
+			re.start()
+			re.drain()
+			re.stop()
+
+			w := newWorker(ns, "1", pool, tstCtxType, nil, jobTypes, nil)
+			w.start()
+			w.drain()
+			w.stop()
+
+			assert.EqualValues(t, 1, atomic.LoadInt64(&runs))
+			assert.Equal(t, tc.wantArgA, argA)
+			assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, "1", job1)))
+			assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, job1)))
+			assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, job1), "1"))
+		})
+	}
+}
