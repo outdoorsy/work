@@ -218,6 +218,79 @@ end
 return nil
 `
 
+// Used by the reaper to free a lock held by a pool that left worker_pools without releasing it.
+// Returns 1 if it removed the pool's lock info field, else 0.
+//
+// KEYS[1] = the job's lock
+// KEYS[2] = the job's lock info hash
+// KEYS[3] = the worker pools set
+// KEYS[4] = the pool's heartbeat hash
+// ARGV[1] = the pool id
+// ARGV[2] = heartbeat cutoff in epoch seconds; a heartbeat after it is fresh
+var redisLuaReapOrphanedLock = `
+local lockKey, lockInfoKey, workerPoolsKey, heartbeatKey = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local poolID = ARGV[1]
+
+if redis.call('sismember', workerPoolsKey, poolID) == 1 then
+  return 0
+end
+local heartbeatAt = redis.call('hget', heartbeatKey, 'heartbeat_at')
+if heartbeatAt then
+  heartbeatAt = tonumber(heartbeatAt)
+  if not heartbeatAt then
+    return redis.error_reply('heartbeat_at is not a number')
+  end
+  if heartbeatAt > tonumber(ARGV[2]) then
+    return 0
+  end
+end
+
+local count = redis.call('hget', lockInfoKey, poolID)
+if not count then
+  return 0
+end
+count = tonumber(count)
+if not count then
+  return redis.error_reply('lock info count is not a number')
+end
+local lock = tonumber(redis.call('get', lockKey) or 0)
+if not lock then
+  return redis.error_reply('lock is not a number')
+end
+
+-- all reads and conversions happen before the first write
+local newLock = lock
+if count ~= 0 then
+  -- never free what pools still in worker_pools hold
+  local liveHeld = 0
+  local info = redis.call('hgetall', lockInfoKey)
+  for i=1,#info,2 do
+    local held = tonumber(info[i+1])
+    if not held then
+      return redis.error_reply('lock info count is not a number')
+    end
+    if held > 0 and redis.call('sismember', workerPoolsKey, info[i]) == 1 then
+      liveHeld = liveHeld + held
+    end
+  end
+  if count > 0 then
+    newLock = math.min(lock, math.max(lock - count, liveHeld))
+  else
+    -- a negative count pays back decrements already applied for this pool
+    newLock = math.max(lock, math.min(lock - count, liveHeld))
+  end
+end
+if newLock < 0 then
+  newLock = 0
+end
+
+redis.call('hdel', lockInfoKey, poolID)
+if newLock ~= lock then
+  redis.call('set', lockKey, newLock)
+end
+return 1
+`
+
 // KEYS[1] = zset of jobs (retry or scheduled), eg work:retry
 // KEYS[2] = zset of dead, eg work:dead. If we don't know the jobName of a job, we'll put it in dead.
 // KEYS[3...] = known job queues, eg ["work:jobs:create_watch", "work:jobs:send_email", ...]

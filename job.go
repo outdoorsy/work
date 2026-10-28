@@ -28,6 +28,7 @@ type Job struct {
 	rawJSON      []byte
 	dequeuedFrom []byte
 	inProgQueue  []byte
+	inProgJSON   []byte // the bytes in inProgQueue; differs from rawJSON once a unique job is swapped in
 	argError     error
 	observer     *observer
 }

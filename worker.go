@@ -185,6 +185,7 @@ func (w *worker) fetchJob() (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	job.inProgJSON = rawJSON
 
 	return job, nil
 }
@@ -260,6 +261,7 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
 		logError("worker.delete_unique_job.updated_job", err)
 		return nil
 	}
+	jobWithArgs.inProgJSON = job.inProgJSON
 
 	return jobWithArgs
 }
@@ -269,7 +271,7 @@ func (w *worker) removeJobFromInProgress(job *Job, fate terminateOp) {
 	defer conn.Close()
 
 	conn.Send("MULTI")
-	conn.Send("LREM", job.inProgQueue, 1, job.rawJSON)
+	conn.Send("LREM", job.inProgQueue, 1, job.inProgJSON)
 	conn.Send("DECR", redisKeyJobsLock(w.namespace, job.Name))
 	conn.Send("HINCRBY", redisKeyJobsLockInfo(w.namespace, job.Name), w.poolID, -1)
 	fate(conn)

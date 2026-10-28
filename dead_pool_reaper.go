@@ -25,6 +25,10 @@ type deadPoolReaper struct {
 
 	stopChan         chan struct{}
 	doneStoppingChan chan struct{}
+
+	// pool ids that were orphans in the previous pass; a pool is reaped only after two passes
+	prevOrphans        map[string]struct{}
+	orphanedLockScript *redis.Script
 }
 
 func newDeadPoolReaper(namespace string, pool *redis.Pool, curJobTypes []string) *deadPoolReaper {
@@ -36,6 +40,9 @@ func newDeadPoolReaper(namespace string, pool *redis.Pool, curJobTypes []string)
 		curJobTypes:      curJobTypes,
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),
+
+		prevOrphans:        map[string]struct{}{},
+		orphanedLockScript: redis.NewScript(4, redisLuaReapOrphanedLock),
 	}
 }
 
@@ -71,6 +78,12 @@ func (r *deadPoolReaper) loop() {
 }
 
 func (r *deadPoolReaper) reap() error {
+	err := r.reapDeadPools()
+	r.reapOrphanedLocks()
+	return err
+}
+
+func (r *deadPoolReaper) reapDeadPools() error {
 	// Get dead pools
 	deadPoolIDs, err := r.findDeadPools()
 	if err != nil {
@@ -106,6 +119,112 @@ func (r *deadPoolReaper) reap() error {
 	}
 
 	return nil
+}
+
+// reapOrphanedLocks frees locks still held by pools that left worker_pools, e.g. a pool whose lock
+// release failed before a graceful stop. findDeadPools only walks worker_pools, so it never sees them.
+func (r *deadPoolReaper) reapOrphanedLocks() {
+	conn := r.pool.Get()
+	defer conn.Close()
+
+	workerPoolsKey := redisKeyWorkerPools(r.namespace)
+	workerPoolIDs, err := redis.Strings(conn.Do("SMEMBERS", workerPoolsKey))
+	if err != nil {
+		logError("dead_pool_reaper.orphan.worker_pools", err)
+		return
+	}
+	livePools := make(map[string]bool, len(workerPoolIDs))
+	for _, poolID := range workerPoolIDs {
+		livePools[poolID] = true
+	}
+
+	for _, jobType := range r.curJobTypes {
+		conn.Send("HKEYS", redisKeyJobsLockInfo(r.namespace, jobType))
+	}
+	if err := conn.Flush(); err != nil {
+		logError("dead_pool_reaper.orphan.lock_info", err)
+		return
+	}
+	candidatesByJob := make(map[string][]string)
+	var candidates []string
+	seen := map[string]bool{}
+	for _, jobType := range r.curJobTypes {
+		poolIDs, err := redis.Strings(conn.Receive())
+		if err != nil {
+			logError("dead_pool_reaper.orphan.lock_info", fmt.Errorf("job %s: %w", jobType, err))
+			continue
+		}
+		for _, poolID := range poolIDs {
+			if livePools[poolID] {
+				continue
+			}
+			candidatesByJob[jobType] = append(candidatesByJob[jobType], poolID)
+			if !seen[poolID] {
+				seen[poolID] = true
+				candidates = append(candidates, poolID)
+			}
+		}
+	}
+
+	// compared as findDeadPools does: a heartbeat after the cutoff is fresh
+	cutoff := time.Now().Add(-r.deadTime)
+	for _, poolID := range candidates {
+		conn.Send("HGET", redisKeyHeartbeat(r.namespace, poolID), "heartbeat_at")
+	}
+	if err := conn.Flush(); err != nil {
+		logError("dead_pool_reaper.orphan.heartbeat", err)
+		return
+	}
+	orphans := make(map[string]struct{}, len(candidates))
+	for _, poolID := range candidates {
+		heartbeatAt, err := redis.Int64(conn.Receive())
+		if err == redis.ErrNil || (err == nil && !time.Unix(heartbeatAt, 0).After(cutoff)) {
+			orphans[poolID] = struct{}{}
+		} else if err != nil {
+			logError("dead_pool_reaper.orphan.heartbeat", fmt.Errorf("pool %s: %w", poolID, err))
+		}
+	}
+
+	confirmed := r.prevOrphans
+	r.prevOrphans = orphans
+
+	if err := r.orphanedLockScript.Load(conn); err != nil {
+		logError("dead_pool_reaper.orphan.load", err)
+		return
+	}
+	reaped := 0
+	for _, jobType := range r.curJobTypes {
+		lockKey := redisKeyJobsLock(r.namespace, jobType)
+		lockInfoKey := redisKeyJobsLockInfo(r.namespace, jobType)
+		var sent []string
+		for _, poolID := range candidatesByJob[jobType] {
+			_, orphan := orphans[poolID]
+			_, wasOrphan := confirmed[poolID]
+			if !orphan || !wasOrphan {
+				continue
+			}
+			r.orphanedLockScript.SendHash(conn, lockKey, lockInfoKey, workerPoolsKey, redisKeyHeartbeat(r.namespace, poolID), poolID, cutoff.Unix())
+			sent = append(sent, poolID)
+		}
+		if len(sent) == 0 {
+			continue
+		}
+		if err := conn.Flush(); err != nil {
+			logError("dead_pool_reaper.orphan", fmt.Errorf("job %s pools %v: %w", jobType, sent, err))
+			continue
+		}
+		for _, poolID := range sent {
+			removed, err := redis.Int(conn.Receive())
+			if err != nil {
+				logError("dead_pool_reaper.orphan", fmt.Errorf("job %s pool %s: %w", jobType, poolID, err))
+				continue
+			}
+			reaped += removed
+		}
+	}
+	if reaped > 0 {
+		logInfo("dead_pool_reaper.orphan", fmt.Sprintf("reaped %d lock info entries of pools gone from worker_pools", reaped))
+	}
 }
 
 func (r *deadPoolReaper) cleanStaleLockInfo(poolID string, jobTypes []string) error {
